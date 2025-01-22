@@ -6,13 +6,21 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage
-from scipy.ndimage import (binary_fill_holes, center_of_mass, find_objects,
-                           label)
+from scipy.ndimage import binary_fill_holes, center_of_mass, find_objects, label
 from sklearn.cluster import KMeans
 
 
 SHARED_BAND_INDEX = 3  # index of 800nm band
 WLS = [630, 544, 480, 800, 754, 677, 605, 528, 442, 866, 910, 939, 978, 1022]
+
+
+def load_data(path: str) -> np.ndarray:
+    """
+    Loads multispectral data from the file path.
+    
+    Aside: I am not sure if your code is setup to apply the bad pixel filtering/debayering on load. If not, this may become two functions.
+    """
+    return np.zeros((15, 1200, 1600))
 
 
 # NOTE: this is a bad function. it will be updated.
@@ -320,11 +328,8 @@ def add_rois(
 
     for centroid in np.unique(data):
 
-        if centroid == 0:
-            continue
-
         # compute possible roi regions
-        band = data == centroid  # mask data for particular classification
+        band = (data == centroid) & ~cluster.mask  # mask data for particular classification
         img = np.array(
             binary_fill_holes(band), dtype=np.uint8
         )  # Fill holes in the mask
@@ -424,10 +429,10 @@ def average_spectra(data, rectangles):
         std_spectrum = region.std(axis=(1, 2))
         std_spectra.append(std_spectrum)
 
-    return averaged_spectra, std_spectra
+    return np.ma.getdata(averaged_spectra), np.ma.getdata(std_spectra)
 
 
-def plot_spectra(spectra, stds, colors):
+def plot_spectra(spectra, stds, colors, markers):
     """
     plot the averaged spectra for each rectangle.
     """
@@ -437,11 +442,16 @@ def plot_spectra(spectra, stds, colors):
     non_bayer_sorted_indices = np.argsort(WLS[3:]) + 3
 
     color_i = 0
+    marker_i = 0
     for i, spectrum in enumerate(spectra):
 
         # cycles colors if need be
         if color_i == len(colors):
             color_i = 0
+            
+        # cycles markers if need be
+        if marker_i == len(markers):
+            marker_i = 0
 
         curr_color = colors[color_i]
 
@@ -456,6 +466,7 @@ def plot_spectra(spectra, stds, colors):
             ecolor=curr_color,
             capsize=3,
             color=curr_color,
+            marker=markers[marker_i]
         )
 
         # plot bayer bands
@@ -464,6 +475,7 @@ def plot_spectra(spectra, stds, colors):
         plt.plot(b_wls, b_data, "+", color=curr_color)  # ,
 
         color_i += 1
+        marker_i += 1
 
     plt.xlabel("wavelength (nm)")
     plt.ylabel("R* = IOF/cos(θ)")
