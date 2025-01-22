@@ -134,7 +134,7 @@ def uncompress(compressed_data, pixel_locations, shape):
     return reconstructed
 
 
-def apply_kmeans_to_masked(masked_array, k):
+def apply_kmeans_to_masked(masked_array, k, seed=42):
     """applies k-means algorithm to masked array."""
     
     # compress array to contain only unmasked values
@@ -146,7 +146,7 @@ def apply_kmeans_to_masked(masked_array, k):
 
     # apply kmeans
     k_means = KMeans(
-        n_clusters=k, random_state=42
+        n_clusters=k, random_state=seed
     )  # NOTE: random state set to make deterministic
     classifications = k_means.fit_predict(compressed_cube)
 
