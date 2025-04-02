@@ -1,89 +1,118 @@
 """
 A module for classifying ROI.
 """
+from pathlib import Path
+from typing import TypedDict
 
+from asdf.zcam_bandset import ZcamBandSet
+from asdf_settings import rapidlooks
 import cv2
+from marslab.imgops.imgutils import crop, eightbit
 import matplotlib.pyplot as plt
 import numpy as np
+from rapid.helpers import get_zcam_bandset
 from scipy import ndimage
 from scipy.ndimage import binary_fill_holes, center_of_mass, find_objects, label
 from sklearn.cluster import KMeans
 
+from mask_helpers import apply_pixmaps
 
-SHARED_BAND_INDEX = 3  # index of 800nm band
+SHARED_BANDS = {"L": "L1", "R": "R1"}
 WLS = [630, 544, 480, 800, 754, 677, 605, 528, 442, 866, 910, 939, 978, 1022]
+ZCAM_CROP = rapidlooks.CROP_SETTINGS["crop"]
 
 
-def load_data(path: str) -> np.ndarray:
-    """
-    Loads multispectral data from the file path.
-    
-    Aside: I am not sure if your code is setup to apply the bad pixel filtering/debayering on load. If not, this may become two functions.
-    """
-    return np.zeros((15, 1200, 1600))
+class LoadResult(TypedDict):
+    l_cube: np.ndarray
+    r_cube: np.ndarray
+    bands: dict[str, np.ndarray]
+    base_bands: dict[str, np.ndarray]
+    bandset: ZcamBandSet
+    pixmaps: dict[str, np.ndarray] | None
 
 
-# NOTE: this is a bad function. it will be updated.
-def trim_margins(cube):
-    """removes constant margins from the edges of passed hyperspectral cube"""
-    
-    # selects value on left border as constant margin value
-    # TODO: this is not great... but it works for now
-    l0_upper_left_pixel = cube[0,0,0]
-    mask = np.any(cube != l0_upper_left_pixel, axis=0)
-
-    vert_offset = 200  # random value so not on top edge. again, bad.
-    left = np.argmax(mask[vert_offset])
-    right = len(mask[vert_offset]) - left - np.argmax(mask[vert_offset, ::-1]) - 1
-
-    v_cut = 5  # arbetrary vertical margin cut
-    trimmed = cube[:, v_cut:-v_cut, left:right]
-    
-    return trimmed
+def load_data(
+    iof_path: str | Path,
+    seq_id: str | int | None = None,
+    obs_ix: int | None = None,
+    do_apply_pixmaps: bool = True,
+    ignore_bayers: bool = False
+):
+    bs = get_zcam_bandset(iof_path, seq_id=seq_id, observation_ix=obs_ix,
+                          load=False)
+    filts = bs.metadata["BAND"].sort_values()
+    if ignore_bayers is True:
+        filts = filts.loc[~filts.str.contains("0")].reset_index()
+    bs.load("all")
+    bs.bulk_debayer("all")
+    base_bands = {b: crop(bs.get_band(b), ZCAM_CROP).copy() for b in filts}
+    if do_apply_pixmaps is True:
+        pixmaps = {
+            b: crop(bs.pixmaps[b], ZCAM_CROP).copy()
+            for b in sorted(bs.metadata["FILTER"].unique())
+        }
+        # NOTE: applying NaN values here is ugly, but cv2.warpPerspective will
+        # not respect a MaskedArray's mask and warping a boolean array is
+        # questionable
+        bands = apply_pixmaps(base_bands, pixmaps)
+    else:
+        pixmaps = None
+        bands = base_bands
+    l_cube = np.array([a for b, a in bands.items() if b.startswith('L')])
+    r_cube = np.array([a for b, a in bands.items() if b.startswith('R')])
+    return {
+        "l_cube": l_cube,
+        "r_cube": r_cube,
+        "bands": bands,
+        "base_bands": base_bands,
+        "pixmaps": pixmaps,
+        "bandset": bs
+    }
 
 
 # NOTE: This approach is not robust to parallax...
-def apply_homography(src_cube, dst_cube):
-    """maps source cube to destination cube using homography transform"""
-    
-    # get shared band data to calculate mapping
-    src_img_raw = src_cube[SHARED_BAND_INDEX]
-    dst_img_raw = dst_cube[SHARED_BAND_INDEX]
+def apply_homography(
+    src_cube: np.ndarray, hmat: np.ndarray, shape: tuple[int, int]
+) -> np.ndarray:
+    # NOTE: in this pipeline, shape _should_ always be the same as
+    # src_cube.shape
+    cube_transformed = []
+    for band in range(src_cube.shape[0]):
+        spec_slice = src_cube[band]
+        warped_img = cv2.warpPerspective(spec_slice, hmat,
+                                         (shape[1], shape[0]))
+        cube_transformed.append(warped_img)
+    return np.array(cube_transformed)
 
-    # scale images for cv2
-    src_img = (np.uint8)((src_img_raw / src_img_raw.max()) * 255)
-    dst_img = (np.uint8)((dst_img_raw / dst_img_raw.max()) * 255)
+
+def compute_homography(
+    src: np.ndarray, dst: np.ndarray, prestretch: int = 1
+) -> np.ndarray:
+    """
+    Compute a homography matrix that maps src to dst. src and dst must be
+    2D ndarrays.
+    """
+    src, dst = map(lambda a: eightbit(a, prestretch), (src, dst))
 
     # detect features and compute descriptors
     sift = cv2.SIFT_create()
-    src_keypoints, src_descriptors = sift.detectAndCompute(src_img, None)
-    dst_keypoints, dst_descriptors = sift.detectAndCompute(dst_img, None)
-
+    src_keypoints, src_descriptors = sift.detectAndCompute(src, None)
+    dst_keypoints, dst_descriptors = sift.detectAndCompute(dst, None)
     # match features using BFMatcher
     bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
     matches = bf.match(src_descriptors, dst_descriptors)
     matches = sorted(matches, key=lambda x: x.distance)  # Sort by distance
-
     # extract matched keypoints
-    src_pts = np.float32([src_keypoints[m.queryIdx].pt for m in matches]).reshape(
+    src_pts = np.float32(
+        [src_keypoints[m.queryIdx].pt for m in matches]).reshape(
         -1, 1, 2
     )
-    dst_pts = np.float32([dst_keypoints[m.trainIdx].pt for m in matches]).reshape(
+    dst_pts = np.float32(
+        [dst_keypoints[m.trainIdx].pt for m in matches]).reshape(
         -1, 1, 2
     )
-
     # compute homography matrix
-    H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    height, width = dst_img_raw.shape
-
-    # apply homography matrix
-    cube_transformed = []
-    for band in range(src_cube.shape[0]):
-        spec_slice = src_cube[band]
-        warped_img = cv2.warpPerspective(spec_slice, H, (width, height))
-        cube_transformed.append(warped_img)
-
-    return np.array(cube_transformed)
+    return cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)[0]
 
 
 def mask_cube(cube, mask):
