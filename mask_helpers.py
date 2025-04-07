@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-import asdf_settings.meta
+import asdf_settings.metadata
 import numpy as np
 
 BAD_FLAGS = ('bad', 'no_signal', 'hot')
 BAD_PIXMAP_VALUES = tuple(
-    i + 1 for i, f in enumerate(asdf_settings.meta.PIXEL_FLAG_NAMES)
+    i + 1 for i, f in enumerate(asdf_settings.metadata.PIXEL_FLAG_NAMES)
     if f in BAD_FLAGS
 )
 
