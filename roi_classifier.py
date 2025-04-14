@@ -1,10 +1,12 @@
 """
 A module for classifying ROI.
 """
+
 from pathlib import Path
 from typing import TypedDict
 
 from asdf.zcam_bandset import ZcamBandSet
+
 # from marslab.bandset.mastcamz import ls_zcam
 from asdf_settings import rapidlooks
 import cv2
@@ -13,7 +15,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 from rapid.helpers import get_zcam_bandset
 from scipy import ndimage
-from scipy.ndimage import binary_fill_holes, center_of_mass, find_objects, label
+from scipy.ndimage import (
+    binary_fill_holes,
+    center_of_mass,
+    find_objects,
+    label,
+    binary_opening,
+    distance_transform_edt,
+)
 from sklearn.cluster import KMeans
 
 from mask_helpers import apply_pixmaps
@@ -37,10 +46,9 @@ def load_data(
     seq_id: str | int | None = None,
     obs_ix: int | None = None,
     do_apply_pixmaps: bool = True,
-    ignore_bayers: bool = False
+    ignore_bayers: bool = False,
 ):
-    bs = get_zcam_bandset(iof_path, seq_id=seq_id, observation_ix=obs_ix,
-                          load=False)
+    bs = get_zcam_bandset(iof_path, seq_id=seq_id, observation_ix=obs_ix, load=False)
     filts = bs.metadata["BAND"].sort_values()
     if ignore_bayers is True:
         filts = filts.loc[~filts.str.contains("0")].reset_index()
@@ -59,15 +67,15 @@ def load_data(
     else:
         pixmaps = None
         bands = base_bands
-    l_cube = np.array([a for b, a in bands.items() if b.startswith('L')])
-    r_cube = np.array([a for b, a in bands.items() if b.startswith('R')])
+    l_cube = np.array([a for b, a in bands.items() if b.startswith("L")])
+    r_cube = np.array([a for b, a in bands.items() if b.startswith("R")])
     return {
         "l_cube": l_cube,
         "r_cube": r_cube,
         "bands": bands,
         "base_bands": base_bands,
         "pixmaps": pixmaps,
-        "bandset": bs
+        "bandset": bs,
     }
 
 
@@ -80,8 +88,7 @@ def apply_homography(
     cube_transformed = []
     for band in range(src_cube.shape[0]):
         spec_slice = src_cube[band]
-        warped_img = cv2.warpPerspective(spec_slice, hmat,
-                                         (shape[1], shape[0]))
+        warped_img = cv2.warpPerspective(spec_slice, hmat, (shape[1], shape[0]))
         cube_transformed.append(warped_img)
     return np.array(cube_transformed)
 
@@ -104,12 +111,10 @@ def compute_homography(
     matches = bf.match(src_descriptors, dst_descriptors)
     matches = sorted(matches, key=lambda x: x.distance)  # Sort by distance
     # extract matched keypoints
-    src_pts = np.float32(
-        [src_keypoints[m.queryIdx].pt for m in matches]).reshape(
+    src_pts = np.float32([src_keypoints[m.queryIdx].pt for m in matches]).reshape(
         -1, 1, 2
     )
-    dst_pts = np.float32(
-        [dst_keypoints[m.trainIdx].pt for m in matches]).reshape(
+    dst_pts = np.float32([dst_keypoints[m.trainIdx].pt for m in matches]).reshape(
         -1, 1, 2
     )
     # compute homography matrix
@@ -118,7 +123,7 @@ def compute_homography(
 
 def mask_cube(cube, mask):
     """applies mask to the cube."""
-    
+
     stacked_mask = np.repeat(mask[np.newaxis, :], cube.shape[0], axis=0)
     masked_cube = np.ma.masked_array(cube, mask=stacked_mask)
 
@@ -128,12 +133,10 @@ def mask_cube(cube, mask):
 def compress_cube(masked_cube):
     """create an array with only vlaid pixels.
     returns new compressed array and valid pixel locations."""
-    
+
     # gets valid spatial locations shared by all bands
     # corresponds to valid pixels
-    spatial_mask = ~masked_cube.mask.any(
-        axis=0
-    )
+    spatial_mask = ~masked_cube.mask.any(axis=0)
 
     # extract valid pixels per band
     compressed_cube = masked_cube[
@@ -148,7 +151,7 @@ def compress_cube(masked_cube):
 
 def uncompress(compressed_data, pixel_locations, shape):
     """remaps values in compressed_data to masked array with shape."""
-    
+
     reconstructed = np.ma.masked_all(shape, dtype=compressed_data.dtype)
     is_cube = len(shape) == 3
 
@@ -166,11 +169,9 @@ def uncompress(compressed_data, pixel_locations, shape):
 
 def apply_kmeans_to_masked(masked_array, k, seed=42):
     """applies k-means algorithm to masked array."""
-    
+
     # compress array to contain only unmasked values
-    spatial_mask = ~masked_array.mask.any(
-        axis=0
-    )
+    spatial_mask = ~masked_array.mask.any(axis=0)
     valid_pixels = masked_array[:, spatial_mask].data  # get valid pixels per band
     compressed_cube = valid_pixels.T.astype(np.float32)  # reshape to (pixels, bands)
 
@@ -188,23 +189,115 @@ def apply_kmeans_to_masked(masked_array, k, seed=42):
     return uncompressed_classifications
 
 
+def cluster_region(
+    region_mask, full_mask, spectral_difference, edge_offset, allowed_variance
+):
+
+    k = 1
+    variance = 0
+    prev_classification = []
+    k_found = False
+
+    # remove any shadow regions
+    cluster_mask = region_mask[0].copy()
+    cluster_mask[full_mask] = 0
+
+    # add offset to edges
+    max_y, max_x = cluster_mask.shape
+    cluster_mask[:, :edge_offset] = 0  # left edge
+    cluster_mask[:, (max_x - edge_offset) :] = 0  # right edge
+    cluster_mask[:edge_offset, :] = 0  # top edge
+    cluster_mask[(max_y - edge_offset) :, :] = 0  # bottom edge
+
+    # erosion/dilation to remove any hairline artifacts from segmentation
+    erosion_kernel = (5, 5)
+    cleaned_mask = binary_opening(cluster_mask, structure=np.ones(erosion_kernel))
+
+    area = np.count_nonzero(cleaned_mask)
+    # print(f'area={area}')
+
+    if area == 0:
+        # print('Empty segment.')
+        return None
+
+    # keep full region for pebbles
+    if area < 4000:
+        # print('Found pebble.')
+        pebble_mask = np.ma.masked_array(
+            np.zeros_like(cleaned_mask).astype(np.int32), mask=~cleaned_mask
+        )
+        return pebble_mask, k
+
+    # TODO: filter by mask area here...
+
+    # get masked image
+    masked_img = mask_cube(spectral_difference, ~cluster_mask)
+
+    # step k value until variance is above ALLOWED_VARIANCE
+    # (previous classification is returned)
+    while not k_found:
+
+        # classify regions
+        curr_classification = apply_kmeans_to_masked(masked_img, k)
+
+        # compute variance of regions
+        # (low variance -> more homogeneous)
+        variance = np.var(curr_classification)
+        # print(f'k={k}, var={variance}')
+
+        # check termination
+        k_found = variance >= allowed_variance
+        if not k_found:
+            prev_classification = curr_classification
+            k += 1
+        else:
+            k -= 1
+
+    # print(f'found k={k}')
+
+    return prev_classification, k
+
+
+def get_center_of_mass(masked_arr):
+
+    # compute density map based on distance from edges (exact euclidean distance transform)
+    distance_transform = distance_transform_edt(masked_arr)
+
+    # normalize distances (ensure greater than 0)
+    normalized_distance = distance_transform / distance_transform.max()
+
+    # apply orriginal array as mask
+    # (we are only interested in density within the target region)
+    density_within_mask = normalized_distance * masked_arr
+
+    # compute highest density location
+    highest_density_loc = np.where(density_within_mask == 1)
+
+    # return only one center of mass
+    # TODO: more sophisticated selection...
+    cxs, cys = highest_density_loc
+    center_of_mass = (int(cxs[0]), int(cys[0]))
+
+    return center_of_mass
+
+
 def filter_connected_components(clustered, min_area, max_area):
     """filters clustered regions based on their contiguous area.
-        returns mask of regions with areas within [mix, max]"""
+    returns mask of regions with areas within [mix, max]"""
     cube_data = clustered.data
     cube_mask = clustered.mask
 
     mask = np.zeros(cube_data.shape)
 
     for label_value in np.unique(cube_data):
-        
+
         # finds connected features in array
         binary_mask = (cube_data == label_value) & ~cube_mask
         labeled_mask, _ = label(binary_mask)
         features = find_objects(labeled_mask)
-        
+
         temp_mask = np.zeros_like(binary_mask)
-        
+
         # populate temp mask
         for i, feature in enumerate(features, start=1):
             # extract the component using the slice
@@ -217,7 +310,7 @@ def filter_connected_components(clustered, min_area, max_area):
 
         # store temp mask
         mask = np.logical_or(mask, temp_mask)
-    
+
     filled_mask = binary_fill_holes(mask)
 
     return filled_mask
@@ -230,21 +323,30 @@ def largest_rect_around_center(mask, center):
     total_cols = mask.shape[1]
 
     # initialize boundaries to point
-    left, right, top, bottom = col, col, row, row
-    
+    left = right = col
+    top = bottom = row
+
     left_inbounds = True
     right_inbounds = True
     top_inbounds = True
     bottom_inbounds = True
-    
+
     # expand in each direction until image edge or mask edge is reached
     # TODO: this is not robust to weird regions
-    while (left_inbounds or right_inbounds or top_inbounds or bottom_inbounds):
-        left_inbounds = (left > 0) and np.all(mask[top : bottom + 1, left - 1 : right + 1] == 1)
-        right_inbounds = (right < total_cols - 1) and np.all(mask[top : bottom + 1, left : right + 2] == 1)
-        top_inbounds = (top > 0) and np.all(mask[top - 1 : bottom + 1, left : right + 1] == 1)
-        bottom_inbounds = (bottom < total_rows - 1) and np.all(mask[top : bottom + 2, left : right + 1] == 1)
-        
+    while left_inbounds or right_inbounds or top_inbounds or bottom_inbounds:
+        left_inbounds = (left > 0) and np.all(
+            mask[top : bottom + 1, left - 1 : right + 1] == 1
+        )
+        right_inbounds = (right < total_cols - 1) and np.all(
+            mask[top : bottom + 1, left : right + 2] == 1
+        )
+        top_inbounds = (top > 0) and np.all(
+            mask[top - 1 : bottom + 1, left : right + 1] == 1
+        )
+        bottom_inbounds = (bottom < total_rows - 1) and np.all(
+            mask[top : bottom + 2, left : right + 1] == 1
+        )
+
         if left_inbounds:
             left -= 1
         if right_inbounds:
@@ -289,7 +391,7 @@ def find_band_roi(binary_array, center_proximity=100, density_threshold=0.7):
     )
 
     # group centers together that are close to eachother
-    # TODO: make this efficent. there are duplicated calculations here... 
+    # TODO: make this efficent. there are duplicated calculations here...
     to_remove = []
     for i, i_center in enumerate(centers):
         if i in to_remove:
@@ -332,13 +434,30 @@ def find_band_roi(binary_array, center_proximity=100, density_threshold=0.7):
     return band_rects
 
 
+def get_roi(masked_arr):
+    """places a rectangle for each center of mass"""
+
+    center_of_mass = get_center_of_mass(masked_arr)
+
+    # find the largest rectangle centered at this point
+    left, top, right, bottom = largest_rect_around_center(masked_arr, center_of_mass)
+
+    width = right - left + 1
+    height = bottom - top + 1
+    area = width * height
+
+    rect = (left, top, width, height)
+
+    return area, rect
+
+
 def get_dist_between(pt1, pt2):
     """computes distance between two points."""
-    
+
     a = (pt1[0] - pt2[0]) ** 2
     b = (pt1[1] - pt2[1]) ** 2
     dist_between = (a + b) ** 0.5
-    
+
     return int(dist_between)
 
 
@@ -359,7 +478,9 @@ def add_rois(
     for centroid in np.unique(data):
 
         # compute possible roi regions
-        band = (data == centroid) & ~cluster.mask  # mask data for particular classification
+        band = (
+            data == centroid
+        ) & ~cluster.mask  # mask data for particular classification
         img = np.array(
             binary_fill_holes(band), dtype=np.uint8
         )  # Fill holes in the mask
@@ -478,7 +599,7 @@ def plot_spectra(spectra, stds, colors, markers):
         # cycles colors if need be
         if color_i == len(colors):
             color_i = 0
-            
+
         # cycles markers if need be
         if marker_i == len(markers):
             marker_i = 0
@@ -496,7 +617,7 @@ def plot_spectra(spectra, stds, colors, markers):
             ecolor=curr_color,
             capsize=3,
             color=curr_color,
-            marker=markers[marker_i]
+            marker=markers[marker_i],
         )
 
         # plot bayer bands
