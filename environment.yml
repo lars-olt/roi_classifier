@@ -1,0 +1,48 @@
+name: roi_classifier
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - opencv
+  - astropy
+  - cytoolz
+  - dustgoggles
+  - fast-histogram
+  - matplotlib
+  - more-itertools
+  - numpy
+  - pandas
+  - pathos
+  - pdr
+  - python-dateutil
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - sympy
+  - hypothesis
+  - rich
+  - boto3
+  - gspread
+  - ipython
+  - ipykernel
+  - fire
+  - fs
+  - google-api-python-client
+  - hugin  # don't include on OSX
+  - oauth2client
+  - python-isal
+  - pyarrow
+  - pytest
+  - pip
+  - git
+  - pip:
+      - torch
+      - torchvision
+      - torchaudio
+      - --index-url https://download.pytorch.org/whl/cu118  # (cuda 11.8) don't include on OSX
+      - sh==0.108  # version works on windows
+      - git+https://github.com/facebookresearch/segment-anything.git
+      - git+https://github.com/MillionConcepts/asdf.git
+      - git+https://github.com/MillionConcepts/marslab.git
+      - git+https://github.com/MillionConcepts/pretty-plot.git
+      - git+https://github.com/MillionConcepts/silencio.git

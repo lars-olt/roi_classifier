@@ -23,12 +23,13 @@ from scipy.ndimage import (
     binary_opening,
     distance_transform_edt,
 )
-from sklearn.cluster import KMeans
+# from sklearn.cluster import KMeans
+import faiss
 
 from mask_helpers import apply_pixmaps
 
 SHARED_BANDS = {"L": "L1", "R": "R1"}
-WLS = [630, 544, 480, 800, 754, 677, 605, 528, 442, 866, 910, 939, 978, 1022]
+WLS = [480, 544, 630, 800, 754, 677, 605, 528, 442, 866, 910, 939, 978, 1022]
 ZCAM_CROP = rapidlooks.CROP_SETTINGS["crop"]
 
 
@@ -167,7 +168,15 @@ def uncompress(compressed_data, pixel_locations, shape):
     return reconstructed
 
 
-def apply_kmeans_to_masked(masked_array, k, seed=42):
+def faiss_kmeans(X, k=10, n_iter=20, seed=42):
+    d = X.shape[1]  # dimensionality (bands)
+    kmeans = faiss.Kmeans(d=d, k=k, niter=n_iter, verbose=True, seed=seed)
+    kmeans.train(X)
+    _, labels = kmeans.index.search(X, 1)  # search returns (distances, indices)
+    return labels, kmeans.centroids
+
+
+def apply_kmeans_to_masked(masked_array, k):
     """applies k-means algorithm to masked array."""
 
     # compress array to contain only unmasked values
@@ -176,15 +185,16 @@ def apply_kmeans_to_masked(masked_array, k, seed=42):
     compressed_cube = valid_pixels.T.astype(np.float32)  # reshape to (pixels, bands)
 
     # apply kmeans
-    k_means = KMeans(
-        n_clusters=k, random_state=seed
-    )  # NOTE: random state set to make deterministic
-    classifications = k_means.fit_predict(compressed_cube)
+    # k_means = KMeans(
+    #     n_clusters=k, random_state=seed
+    # )  # NOTE: random state set to make deterministic
+    # classifications = k_means.fit_predict(compressed_cube)
+    classifications, _ = faiss_kmeans(compressed_cube, k=k)
 
     # uncompress k-means classifications to orriginal masked shape
     _, h, w = masked_array.shape
     pixel_indices = np.argwhere(spatial_mask).T
-    uncompressed_classifications = uncompress(classifications, pixel_indices, (h, w))
+    uncompressed_classifications = uncompress(classifications[:, 0], pixel_indices, (h, w))
 
     return uncompressed_classifications
 
