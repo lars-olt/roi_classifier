@@ -7,3 +7,5 @@
 
 algo_eval.ipynb
 download_iofs.sh
+load_spdl_data.ipynb
+credentials.json
