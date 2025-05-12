@@ -9,3 +9,5 @@ algo_eval.ipynb
 download_iofs.sh
 load_spdl_data.ipynb
 credentials.json
+sam_vit_h_4b8939.pth
+Mastcam-Z_multispectral_database_sols0-1269.csv
